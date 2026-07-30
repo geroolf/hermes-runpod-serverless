@@ -23,6 +23,7 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="86-real;89-real" \
         -DGGML_NATIVE=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
