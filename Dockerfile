@@ -27,7 +27,7 @@ RUN git clone https://github.com/ggml-org/llama.cpp.git \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_TOOLS=OFF \
+        -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_CURL=OFF \
     && cmake --build build --config Release --target llama-server -j"$(nproc)" \
     && strip build/bin/llama-server
