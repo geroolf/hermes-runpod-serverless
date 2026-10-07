@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG CUDA_VERSION=12.4.1
 ARG UBUNTU_VERSION=22.04
 
@@ -50,6 +51,13 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /app/requirements.txt
 
+# Qwen3.8-27B vision projector (qwen3vl_merger, F16), pinned by revision and
+# checksum. Baked into the image because RunPod's cached-model mount carries
+# only the single production GGUF.
+ADD --checksum=sha256:cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e \
+    https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502/mmproj-F16.gguf \
+    /models/mmproj-F16.gguf
+
 COPY --from=llama-builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 COPY app.py /app/app.py
 
@@ -62,7 +70,8 @@ ENV PYTHONUNBUFFERED=1 \
     LLAMA_PORT=8080 \
     MODEL_REPO=oolfBER/Qwen3.6-27B-UD-Q4_K_XL-single-GGUF \
     MODEL_FILENAME=Qwen3.6-27B-UD-Q4_K_XL.gguf \
-    MODEL_ALIAS=qwen3.6-27b-local
+    MODEL_ALIAS=qwen3.6-27b-local \
+    MMPROJ_PATH=/models/mmproj-F16.gguf
 
 EXPOSE 80
 STOPSIGNAL SIGTERM

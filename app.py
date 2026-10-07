@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import glob
 import logging
 import os
+import re
 import signal
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import AsyncIterator
@@ -37,7 +41,17 @@ MODEL_ALIAS = os.getenv("MODEL_ALIAS", "qwen3.6-27b-local")
 MODEL_EXPECTED_SIZE = int(os.getenv("MODEL_EXPECTED_SIZE", "17909097600"))
 MODEL_SEARCH_TIMEOUT = int(os.getenv("MODEL_SEARCH_TIMEOUT", "300"))
 MODEL_LOAD_TIMEOUT = int(os.getenv("MODEL_LOAD_TIMEOUT", "600"))
+# Vision projector. Empty disables vision. If llama-server cannot start with
+# the projector, the worker falls back to text-only instead of failing.
+MMPROJ_PATH = os.getenv("MMPROJ_PATH", "")
 PORT = int(os.getenv("PORT", "80"))
+
+# llama-server load lines worth keeping for /worker/status (memory budget,
+# projector). Prompt text is never logged by llama-server at this verbosity.
+LOAD_LOG_PATTERN = re.compile(
+    r"buffer size|MiB|projector|mmproj|clip_|load_hparams|CUDA0|ggml_cuda",
+    re.IGNORECASE,
+)
 
 HOP_BY_HOP_HEADERS = {
     "authorization",
@@ -63,6 +77,9 @@ app = FastAPI(
 llama_process: subprocess.Popen[bytes] | None = None
 llama_ready = asyncio.Event()
 llama_failed: str | None = None
+vision_enabled = False
+vision_error: str | None = None
+load_log: collections.deque[str] = collections.deque(maxlen=120)
 started_at = time.monotonic()
 ready_at: float | None = None
 request_slot = asyncio.Semaphore(1)
@@ -112,7 +129,15 @@ def find_model() -> Path | None:
     return None
 
 
-def llama_command(model_path: Path) -> list[str]:
+def find_mmproj() -> Path | None:
+    if not MMPROJ_PATH:
+        return None
+    candidate = Path(MMPROJ_PATH)
+    return candidate.resolve() if candidate.is_file() else None
+
+
+def llama_command(model_path: Path, mmproj_path: Path | None) -> list[str]:
+    vision_args = ["--mmproj", str(mmproj_path)] if mmproj_path else []
     return [
         "/usr/local/bin/llama-server",
         "--model",
@@ -137,7 +162,58 @@ def llama_command(model_path: Path) -> list[str]:
         "q4_0",
         "--jinja",
         "--no-webui",
+        *vision_args,
     ]
+
+
+def forward_llama_output(stream) -> None:
+    # Keep the container log identical to before while remembering the
+    # memory/projector lines for /worker/status.
+    for raw_line in iter(stream.readline, b""):
+        sys.stdout.buffer.write(raw_line)
+        sys.stdout.buffer.flush()
+        line = raw_line.decode("utf-8", "replace").rstrip()
+        if LOAD_LOG_PATTERN.search(line):
+            load_log.append(line[:300])
+    stream.close()
+
+
+def start_llama(model_path: Path, mmproj_path: Path | None) -> None:
+    global llama_process
+
+    llama_process = subprocess.Popen(
+        llama_command(model_path, mmproj_path),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    threading.Thread(
+        target=forward_llama_output,
+        args=(llama_process.stdout,),
+        daemon=True,
+    ).start()
+    logger.info(
+        "llama-server started pid=%s vision=%s",
+        llama_process.pid,
+        bool(mmproj_path),
+    )
+
+
+def gpu_memory() -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.total",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
 
 
 async def wait_for_model() -> Path:
@@ -181,8 +257,14 @@ async def wait_for_llama() -> None:
     )
 
 
+async def stop_llama() -> None:
+    if llama_process and llama_process.poll() is None:
+        llama_process.kill()
+        await asyncio.to_thread(llama_process.wait)
+
+
 async def launch_llama() -> None:
-    global llama_process, llama_failed
+    global llama_failed, vision_enabled, vision_error
 
     try:
         model_path = await wait_for_model()
@@ -191,11 +273,24 @@ async def launch_llama() -> None:
             model_path,
             model_path.stat().st_size,
         )
-        llama_process = subprocess.Popen(
-            llama_command(model_path),
-            stdin=subprocess.DEVNULL,
-        )
-        logger.info("llama-server started pid=%s", llama_process.pid)
+        mmproj_path = find_mmproj()
+        if MMPROJ_PATH and not mmproj_path:
+            vision_error = f"projector not found: {MMPROJ_PATH}"
+            logger.warning(vision_error)
+
+        if mmproj_path:
+            start_llama(model_path, mmproj_path)
+            try:
+                await wait_for_llama()
+                vision_enabled = True
+                return
+            except Exception as exc:
+                vision_error = f"vision start failed: {exc}"
+                logger.exception("starting with projector failed")
+                await stop_llama()
+                logger.warning("falling back to text-only llama-server")
+
+        start_llama(model_path, None)
         await wait_for_llama()
     except Exception as exc:
         llama_failed = str(exc)
@@ -223,6 +318,19 @@ async def shutdown() -> None:
 @app.get("/ping")
 async def ping() -> Response:
     if llama_ready.is_set():
+        if llama_process and llama_process.poll() is not None:
+            # llama-server died after start (e.g. out of GPU memory). Report
+            # unhealthy so RunPod replaces the worker instead of serving 502s.
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "failed",
+                    "error": (
+                        "llama-server exited with status "
+                        f"{llama_process.returncode}"
+                    ),
+                },
+            )
         return Response(status_code=200)
     if llama_failed:
         return JSONResponse(
@@ -243,6 +351,11 @@ async def worker_status() -> dict[str, object]:
         "initialization_seconds": (
             round(ready_at - started_at, 3) if ready_at else None
         ),
+        "vision_enabled": vision_enabled,
+        "vision_error": vision_error,
+        "mmproj_path": MMPROJ_PATH or None,
+        "gpu_memory": await asyncio.to_thread(gpu_memory),
+        "load_log": list(load_log),
     }
 
 

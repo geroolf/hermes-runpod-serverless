@@ -31,6 +31,26 @@ External authentication is provided by the RunPod endpoint.
 The image does not contain the GGUF. RunPod's cached-model mount supplies it
 under `/runpod-volume/huggingface-cache/hub`.
 
+## Vision
+
+The image bakes in the Qwen3.8-27B vision projector
+(`unsloth/Qwen3.8-27B-GGUF` revision `4ca7207`, `mmproj-F16.gguf`,
+927,607,488 bytes, checksum-pinned) at `/models/mmproj-F16.gguf` and starts
+`llama-server` with `--mmproj`. Set `MMPROJ_PATH=` (empty) to disable vision.
+
+If `llama-server` cannot start with the projector, the worker falls back to
+text-only and reports `vision_enabled: false` plus `vision_error` in
+`/worker/status`. `/worker/status` also reports `gpu_memory` (nvidia-smi) and
+the `llama-server` buffer-size lines from model load.
+
+If `llama-server` exits after it was ready (for example out of GPU memory
+while encoding an image), `/ping` returns `503` so RunPod replaces the worker.
+
+The projector needs about 0.9 GiB of VRAM plus a compute buffer while an
+image is encoded. Keep the endpoint on 24 GiB cards (RTX 3090, RTX A5000);
+the NVIDIA L4 (about 22.5 GiB usable) is too tight at the 114,688-token
+context.
+
 ## Local container test
 
 The full model needs an NVIDIA GPU. With a model mounted explicitly:
